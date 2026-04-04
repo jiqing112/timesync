@@ -4,41 +4,23 @@ Windows 时间同步工具 - GUI 版本
 """
 
 import ctypes
-import sys
 import datetime
+import logging
 import threading
-import ntplib
-import subprocess
 import tkinter as tk
-from tkinter import ttk
-from ctypes import wintypes
+from tkinter import ttk, messagebox
+
+from ntp_utils import (
+    is_admin,
+    get_ntp_time,
+    get_local_time,
+    set_system_time,
+    setup_logging,
+)
 
 ctypes.windll.kernel32.FreeConsole()
 
-class SYSTEMTIME(ctypes.Structure):
-    _fields_ = [
-        ("wYear", wintypes.WORD),
-        ("wMonth", wintypes.WORD),
-        ("wDayOfWeek", wintypes.WORD),
-        ("wDay", wintypes.WORD),
-        ("wHour", wintypes.WORD),
-        ("wMinute", wintypes.WORD),
-        ("wSecond", wintypes.WORD),
-        ("wMilliseconds", wintypes.WORD),
-    ]
-
-kernel32 = ctypes.windll.kernel32
-SetSystemTime = kernel32.SetSystemTime
-SetSystemTime.argtypes = [ctypes.POINTER(SYSTEMTIME)]
-SetSystemTime.restype = wintypes.BOOL
-
-NTP_SERVERS = [
-    "ntp.aliyun.com",
-    "ntp.tencent.com",
-    "cn.pool.ntp.org",
-    "ntp.ntsc.ac.cn",
-    "time.windows.com",
-]
+logger = logging.getLogger("time_sync")
 
 TIMEZONES = [
     ("UTC+8", 8),
@@ -48,6 +30,9 @@ TIMEZONES = [
     ("UTC-5", -5),
     ("UTC-8", -8),
 ]
+
+# NTP 自动刷新间隔（毫秒），60 秒避免对服务器造成压力
+NTP_REFRESH_INTERVAL_MS = 60_000
 
 
 def center_window(window, width, height):
@@ -66,22 +51,26 @@ class TimeSyncGUI:
         self.root.resizable(False, False)
         center_window(self.root, 400, 340)
 
-        self.ntp_time = None
-        self.ntp_local_ref = None
-        self.time_offset = 8
+        self.ntp_time = None          # UTC naive datetime
+        self.ntp_local_ref = None     # 获取 NTP 时间时的本地时间快照
+        self.ntp_delay = None         # 网络延迟（秒）
+        self.time_offset = 8          # 时区偏移（小时）
         self.running = True
         self.syncing = False
 
         self.setup_ui()
         self.update_local_time()
         self.root.after(500, self.refresh_ntp_time)
-        self.root.after(5000, self.periodic_refresh)
+        self.root.after(NTP_REFRESH_INTERVAL_MS, self.periodic_refresh)
 
     def setup_ui(self):
         main_frame = ttk.Frame(self.root, padding="15")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        title_label = ttk.Label(main_frame, text="Windows 时间同步", font=("Microsoft YaHei", 14, "bold"))
+        title_label = ttk.Label(
+            main_frame, text="Windows 时间同步",
+            font=("Microsoft YaHei", 14, "bold")
+        )
         title_label.pack(pady=(0, 10))
 
         time_frame = ttk.LabelFrame(main_frame, text="时间显示", padding="10")
@@ -100,7 +89,10 @@ class TimeSyncGUI:
         self.diff_label.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
 
         ttk.Label(time_frame, text="时区:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.tz_combo = ttk.Combobox(time_frame, values=[tz[0] for tz in TIMEZONES], state="readonly", width=15)
+        self.tz_combo = ttk.Combobox(
+            time_frame, values=[tz[0] for tz in TIMEZONES],
+            state="readonly", width=15
+        )
         self.tz_combo.current(0)
         self.tz_combo.grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
         self.tz_combo.bind("<<ComboboxSelected>>", self.on_tz_changed)
@@ -114,7 +106,10 @@ class TimeSyncGUI:
         self.refresh_btn = ttk.Button(btn_frame, text="刷新时间", command=self.refresh_ntp_time, width=12)
         self.refresh_btn.pack(side=tk.LEFT, padx=5)
 
-        self.status_label = ttk.Label(main_frame, text="正在获取服务器时间...", foreground="blue", font=("Microsoft YaHei", 10))
+        self.status_label = ttk.Label(
+            main_frame, text="正在获取服务器时间...",
+            foreground="blue", font=("Microsoft YaHei", 10)
+        )
         self.status_label.pack(pady=5)
 
     def on_tz_changed(self, event):
@@ -124,39 +119,31 @@ class TimeSyncGUI:
                 self.time_offset = offset
                 break
 
-    def get_local_time(self):
-        return datetime.datetime.now()
-
-    def get_ntp_time(self):
-        client = ntplib.NTPClient()
-        for server in NTP_SERVERS:
-            try:
-                response = client.request(server, version=3, timeout=3)
-                delay = response.delay
-                corrected_time = response.tx_time - (delay / 2.0)
-                utc_dt = datetime.datetime.fromtimestamp(corrected_time, datetime.timezone.utc)
-                return utc_dt.replace(tzinfo=None), delay
-            except:
-                continue
-        return None, None
-
     def format_time(self, dt):
         if dt is None:
             return "获取失败"
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    def _get_current_ntp_local(self) -> datetime.datetime | None:
+        """根据 NTP 快照和本地时间流逝，推算当前的 NTP 本地时间"""
+        if self.ntp_time is None or self.ntp_local_ref is None:
+            return None
+        offset = datetime.timedelta(hours=self.time_offset)
+        elapsed = (get_local_time() - self.ntp_local_ref).total_seconds()
+        return self.ntp_time + datetime.timedelta(seconds=elapsed) + offset
+
     def update_local_time(self):
         if not self.running:
             return
-        local = self.get_local_time()
+        local = get_local_time()
         self.local_time_label.config(text=self.format_time(local))
-        if self.ntp_time and self.ntp_local_ref:
-            offset = datetime.timedelta(hours=self.time_offset)
-            elapsed = (local - self.ntp_local_ref).total_seconds()
-            current_ntp = self.ntp_time + datetime.timedelta(seconds=elapsed) + offset
+
+        current_ntp = self._get_current_ntp_local()
+        if current_ntp is not None:
             self.ntp_time_label.config(text=self.format_time(current_ntp))
             diff = abs((local - current_ntp).total_seconds())
             self.diff_label.config(text=f"{diff:.2f} 秒")
+
         self.root.after(1000, self.update_local_time)
 
     def refresh_ntp_time(self):
@@ -165,8 +152,8 @@ class TimeSyncGUI:
         self.sync_btn.config(state=tk.DISABLED)
 
         def worker():
-            ntp, delay = self.get_ntp_time()
-            local_ref = datetime.datetime.now()
+            ntp, delay = get_ntp_time(timeout=3)
+            local_ref = get_local_time()
             self.root.after(0, lambda: self.on_ntp_ready(ntp, local_ref, delay))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -174,31 +161,32 @@ class TimeSyncGUI:
     def on_ntp_ready(self, ntp_time, local_ref, delay):
         self.ntp_time = ntp_time
         self.ntp_local_ref = local_ref
+        self.ntp_delay = delay
         self.refresh_btn.config(state=tk.NORMAL)
         self.sync_btn.config(state=tk.NORMAL)
-        if self.ntp_time:
+
+        if self.ntp_time is not None:
             offset = datetime.timedelta(hours=self.time_offset)
             adjusted = self.ntp_time + offset
             self.ntp_time_label.config(text=self.format_time(adjusted))
-            local = self.get_local_time()
+
+            local = get_local_time()
             diff = abs((local - adjusted).total_seconds())
-            delay_ms = f"{delay*1000:.0f}" if delay else "?"
+            delay_ms = f"{delay * 1000:.0f}" if delay else "?"
             self.diff_label.config(text=f"{diff:.2f} 秒 (延迟{delay_ms}ms)")
-            self.status_label.config(text="获取成功，正在同步...", foreground="green")
-            if ctypes.windll.shell32.IsUserAnAdmin() and not self.syncing:
-                self.sync_time()
-            else:
-                self.status_label.config(text="获取成功", foreground="green")
+            self.status_label.config(text="获取成功", foreground="green")
+            logger.info("NTP 时间获取成功, 差异 %.2f 秒", diff)
         else:
             self.ntp_time_label.config(text="获取失败")
             self.status_label.config(text="获取失败，请检查网络", foreground="red")
+            logger.warning("NTP 时间获取失败")
 
     def sync_time(self):
-        if not self.ntp_time:
+        if self.ntp_time is None:
             self.status_label.config(text="请先刷新获取服务器时间！", foreground="orange")
             return
 
-        if not ctypes.windll.shell32.IsUserAnAdmin():
+        if not is_admin():
             self.status_label.config(text="需要管理员权限！", foreground="red")
             return
 
@@ -211,51 +199,61 @@ class TimeSyncGUI:
 
         def worker():
             try:
-                now = datetime.datetime.now()
-                elapsed = (now - self.ntp_local_ref).total_seconds()
-                corrected_ntp = self.ntp_time + datetime.timedelta(seconds=elapsed)
+                ntp_ref = self.ntp_time
+                local_ref = self.ntp_local_ref
+                if ntp_ref is None or local_ref is None:
+                    return
+                now = get_local_time()
+                elapsed = (now - local_ref).total_seconds()
+                corrected_utc = ntp_ref + datetime.timedelta(seconds=elapsed)
 
-                st = SYSTEMTIME()
-                st.wYear = corrected_ntp.year
-                st.wMonth = corrected_ntp.month
-                st.wDay = corrected_ntp.day
-                st.wHour = corrected_ntp.hour
-                st.wMinute = corrected_ntp.minute
-                st.wSecond = corrected_ntp.second
-                st.wMilliseconds = corrected_ntp.microsecond // 1000
+                success = set_system_time(corrected_utc)
 
-                if not SetSystemTime(ctypes.byref(st)):
-                    raise ctypes.WinError()
-
-                target_time = corrected_ntp + datetime.timedelta(hours=self.time_offset)
-                self.root.after(0, lambda: self.on_sync_success(target_time.strftime("%Y-%m-%d %H:%M:%S")))
+                if success:
+                    local_time = corrected_utc + datetime.timedelta(hours=self.time_offset)
+                    time_str = local_time.strftime("%Y-%m-%d %H:%M:%S")
+                    self.root.after(0, lambda: self.on_sync_success(corrected_utc, time_str))
+                else:
+                    self.root.after(0, lambda: self.status_label.config(
+                        text="同步失败，请检查权限", foreground="red"
+                    ))
             except Exception as e:
-                self.root.after(0, lambda: self.status_label.config(text=f"同步失败: {str(e)[:20]}", foreground="red"))
+                logger.error("同步异常: %s", e)
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"同步失败: {str(e)[:30]}", foreground="red"
+                ))
             finally:
-                self.root.after(0, lambda: setattr(self, 'syncing', False))
-                self.root.after(0, lambda: self.sync_btn.config(state=tk.NORMAL))
+                self.root.after(0, self._finish_sync)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_sync_success(self, date_str):
-        time_str = date_str.split(" ")[1]
-        target = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-        utc_ntp = target - datetime.timedelta(hours=self.time_offset)
-        self.ntp_time = utc_ntp
-        self.ntp_local_ref = datetime.datetime.now()
-        self.status_label.config(text=f"同步成功！ {date_str} {time_str}", foreground="green")
+    def _finish_sync(self):
+        self.syncing = False
+        self.sync_btn.config(state=tk.NORMAL)
+
+    def on_sync_success(self, utc_time, display_str):
+        # 更新 NTP 参考点，使后续时间推算基于新的基准
+        self.ntp_time = utc_time
+        self.ntp_local_ref = get_local_time()
+        self.status_label.config(text=f"同步成功！{display_str}", foreground="green")
+        logger.info("时间同步成功: %s", display_str)
 
     def periodic_refresh(self):
-        if self.running:
-            self.refresh_ntp_time()
-        self.root.after(5000, self.periodic_refresh)
+        if not self.running:
+            return  # 窗口已关闭，不再调度
+        self.refresh_ntp_time()
+        self.root.after(NTP_REFRESH_INTERVAL_MS, self.periodic_refresh)
 
     def on_close(self):
+        if self.syncing:
+            if not messagebox.askyesno("确认", "正在同步时间，确定要退出吗？"):
+                return
         self.running = False
         self.root.destroy()
 
 
 def main():
+    setup_logging(level=logging.INFO)
     root = tk.Tk()
     app = TimeSyncGUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)

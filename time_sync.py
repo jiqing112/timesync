@@ -1,14 +1,29 @@
 """
-Windows 时间同步工具
+Windows 时间同步工具 - CLI 版本
 自动从 NTP 服务器获取标准时间，与本地时间比较，超过阈值自动同步。
 适用于北京时间 (UTC+8)。
 """
 
-import ctypes
 import sys
-import datetime
-import ntplib
-import subprocess
+import logging
+
+from ntp_utils import (
+    NTP_SERVERS,
+    THRESHOLD_SECONDS,
+    is_admin,
+    run_as_admin,
+    get_ntp_time,
+    get_local_time,
+    set_system_time,
+    utc_to_local,
+    format_time,
+    setup_logging,
+)
+
+# 北京时间偏移
+UTC_OFFSET_HOURS = 8
+
+logger = logging.getLogger("time_sync")
 
 
 def wait_exit():
@@ -19,100 +34,9 @@ def wait_exit():
         pass
 
 
-# ============== 配置 ==============
-# NTP 服务器列表（按优先级排序）
-NTP_SERVERS = [
-    "ntp.aliyun.com",       # 阿里云 NTP
-    "ntp.tencent.com",      # 腾讯云 NTP
-    "cn.pool.ntp.org",      # 中国 NTP 池
-    "ntp.ntsc.ac.cn",       # 中国国家授时中心
-    "time.windows.com",     # 微软 NTP
-]
-
-# 时间差异阈值（秒），超过此值则自动同步
-THRESHOLD_SECONDS = 2.0
-
-# 北京时间时区偏移（UTC+8）
-BEIJING_UTC_OFFSET = datetime.timedelta(hours=8)
-
-
-def is_admin() -> bool:
-    """检查当前是否以管理员权限运行"""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
-
-
-def run_as_admin():
-    """以管理员权限重新启动本脚本"""
-    print("[!] 修改系统时间需要管理员权限，正在请求提升权限...")
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, " ".join(sys.argv), None, 1
-    )
-    sys.exit(0)
-
-
-def get_local_time() -> datetime.datetime:
-    """获取本地系统时间（北京时间）"""
-    return datetime.datetime.now()
-
-
-def get_ntp_time() -> datetime.datetime | None:
-    """
-    从 NTP 服务器获取标准 UTC 时间，转换为北京时间。
-    依次尝试多个服务器，直到成功。
-    """
-    client = ntplib.NTPClient()
-    for server in NTP_SERVERS:
-        try:
-            print(f"  正在连接 NTP 服务器: {server} ...")
-            response = client.request(server, version=3, timeout=5)
-            utc_time = datetime.datetime.fromtimestamp(response.tx_time, tz=datetime.timezone.utc)
-            beijing_time = utc_time + BEIJING_UTC_OFFSET
-            beijing_time = beijing_time.replace(tzinfo=None)  # 转为 naive 以便与本地时间比较
-            print(f"  [OK] 成功从 {server} 获取时间")
-            return beijing_time
-        except Exception as e:
-            print(f"  [FAIL] {server} 连接失败: {e}")
-            continue
-    return None
-
-
-def set_system_time(target_time: datetime.datetime):
-    """
-    使用 w32tm 命令或 Windows API 设置系统时间。
-    需要管理员权限。
-    """
-    # 方法：使用 Windows date 和 time 命令
-    date_str = target_time.strftime("%Y-%m-%d")
-    time_str = target_time.strftime("%H:%M:%S")
-
-    try:
-        # 使用 PowerShell 设置系统时间（更可靠）
-        ps_cmd = f"Set-Date -Date '{date_str} {time_str}'"
-        result = subprocess.run(
-            ["powershell", "-Command", ps_cmd],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            print(f"  [OK] 系统时间已设置为: {date_str} {time_str}")
-            return True
-        else:
-            print(f"  [FAIL] 设置时间失败: {result.stderr.strip()}")
-            return False
-    except Exception as e:
-        print(f"  [FAIL] 设置时间时发生异常: {e}")
-        return False
-
-
-def format_time(dt: datetime.datetime) -> str:
-    """格式化时间为易读字符串"""
-    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-
 def main():
+    setup_logging(level=logging.DEBUG)
+
     print("=" * 56)
     print("       Windows 时间同步工具 (北京时间 UTC+8)")
     print("=" * 56)
@@ -126,24 +50,27 @@ def main():
 
     # 2. 获取 NTP 服务器时间
     print("[2] 从 NTP 服务器获取标准时间...")
-    ntp_time = get_ntp_time()
-    if ntp_time is None:
+    ntp_utc, delay = get_ntp_time(timeout=5, verbose=True)
+    if ntp_utc is None:
         print()
         print("[ERROR] 无法从任何 NTP 服务器获取时间！")
         print("  请检查网络连接后重试。")
         wait_exit()
         sys.exit(1)
 
-    print(f"    标准时间: {format_time(ntp_time)}")
+    ntp_beijing = utc_to_local(ntp_utc, UTC_OFFSET_HOURS)
+    print(f"    标准时间: {format_time(ntp_beijing)}")
+    if delay is not None:
+        print(f"    网络延迟: {delay*1000:.0f}ms")
     print()
 
     # 3. 比较时间差异
     print("[3] 比较时间差异...")
     # 重新获取本地时间以减少网络延迟带来的误差
     local_time = get_local_time()
-    diff = abs((local_time - ntp_time).total_seconds())
+    diff = abs((local_time - ntp_beijing).total_seconds())
     print(f"    本地时间: {format_time(local_time)}")
-    print(f"    标准时间: {format_time(ntp_time)}")
+    print(f"    标准时间: {format_time(ntp_beijing)}")
     print(f"    时间差异: {diff:.3f} 秒")
     print(f"    同步阈值: {THRESHOLD_SECONDS} 秒")
     print()
@@ -159,24 +86,27 @@ def main():
 
     # 5. 检查管理员权限
     if not is_admin():
+        print("[!] 修改系统时间需要管理员权限，正在请求提升权限...")
         run_as_admin()
 
-    # 6. 执行同步
+    # 6. 执行同步 - 再次获取 NTP 时间以确保准确
     print("[4] 正在同步系统时间...")
-    # 再次获取 NTP 时间以确保准确
-    ntp_time = get_ntp_time()
-    if ntp_time is None:
+    ntp_utc, delay = get_ntp_time(timeout=5, verbose=True)
+    if ntp_utc is None:
         print("[ERROR] 同步前再次获取 NTP 时间失败！")
         wait_exit()
         sys.exit(1)
 
-    success = set_system_time(ntp_time)
+    success = set_system_time(ntp_utc)
+    ntp_beijing = utc_to_local(ntp_utc, UTC_OFFSET_HOURS)
     print()
 
     if success:
+        print(f"  [OK] 系统时间已设置为: {format_time(ntp_beijing)}")
         # 验证同步结果
         new_local = get_local_time()
-        new_diff = abs((new_local - ntp_time).total_seconds())
+        new_diff = abs((new_local - ntp_beijing).total_seconds())
+        print()
         print("[5] 同步验证:")
         print(f"    同步后本地时间: {format_time(new_local)}")
         print(f"    同步后时间差异: {new_diff:.3f} 秒")
