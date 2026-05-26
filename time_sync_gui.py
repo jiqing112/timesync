@@ -16,6 +16,7 @@ from ntp_utils import (
     get_local_time,
     set_system_time,
     setup_logging,
+    THRESHOLD_SECONDS,
 )
 
 ctypes.windll.kernel32.FreeConsole()
@@ -31,8 +32,8 @@ TIMEZONES = [
     ("UTC-8", -8),
 ]
 
-# NTP 自动刷新间隔（毫秒），60 秒避免对服务器造成压力
-NTP_REFRESH_INTERVAL_MS = 60_000
+# NTP 自动刷新间隔（毫秒），5 秒
+NTP_REFRESH_INTERVAL_MS = 5_000
 
 
 def center_window(window, width, height):
@@ -174,12 +175,21 @@ class TimeSyncGUI:
             diff = abs((local - adjusted).total_seconds())
             delay_ms = f"{delay * 1000:.0f}" if delay else "?"
             self.diff_label.config(text=f"{diff:.2f} 秒 (延迟{delay_ms}ms)")
-            self.status_label.config(text="获取成功", foreground="green")
-            logger.info("NTP 时间获取成功, 差异 %.2f 秒", diff)
+            logger.info("NTP time synced, diff=%.2f sec", diff)
+
+            if is_admin():
+                if diff > THRESHOLD_SECONDS:
+                    self.status_label.config(text=f"差异 {diff:.2f}s > {THRESHOLD_SECONDS}s, 正在自动同步...", foreground="orange")
+                    logger.info("Time diff %.2f > threshold %.2f, auto syncing...", diff, THRESHOLD_SECONDS)
+                    self.sync_time()
+                else:
+                    self.status_label.config(text=f"时间差异 {diff:.2f}s, 无需同步", foreground="green")
+            else:
+                self.status_label.config(text="获取成功 (需管理员权限同步)", foreground="blue")
         else:
             self.ntp_time_label.config(text="获取失败")
             self.status_label.config(text="获取失败，请检查网络", foreground="red")
-            logger.warning("NTP 时间获取失败")
+            logger.warning("NTP time fetch failed")
 
     def sync_time(self):
         if self.ntp_time is None:
